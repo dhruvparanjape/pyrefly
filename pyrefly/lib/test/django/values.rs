@@ -8,9 +8,9 @@
 use crate::django_testcase;
 
 django_testcase!(
-    bug = "values() row values are Any",
     test_values_rows,
     r#"
+from decimal import Decimal
 from typing import Any, assert_type
 
 from django.db import models
@@ -26,19 +26,19 @@ class Book(models.Model):
     author = models.ForeignKey(Author, on_delete=models.CASCADE)
 
 row = Book.objects.values("title", "subtitle", "price", "pk", "author", "author__name", upper=F("title")).get()
-assert_type(row["title"], Any)
-assert_type(row["subtitle"], Any)
-assert_type(row["price"], Any)
-assert_type(row["pk"], Any)
-assert_type(row["author"], Any)
+assert_type(row["title"], str)
+assert_type(row["subtitle"], str | None)
+assert_type(row["price"], Decimal)
+assert_type(row["pk"], int)
+assert_type(row["author"], int)
 assert_type(row["author__name"], Any)
 assert_type(row["upper"], Any)
 
 first = Book.objects.filter(title="x").values("title").first()
 if first is not None:
-    assert_type(first["title"], Any)
+    assert_type(first["title"], str)
 for sliced in Book.objects.values("title").order_by("title")[:5]:
-    assert_type(sliced["title"], Any)
+    assert_type(sliced["title"], str)
 rows: list[dict[str, Any]] = list(Book.objects.values("title", "price"))
 "#,
 );
@@ -61,8 +61,9 @@ def check(names: list[str]) -> None:
 "#,
 );
 
+// A positional annotation adds a key named by Django, such as `id__count`, so the row goes back
+// to `dict[str, Any]`.
 django_testcase!(
-    bug = "values() row values are Any",
     test_values_then_annotate,
     r#"
 from typing import Any, assert_type
@@ -74,7 +75,7 @@ class Book(models.Model):
     title = models.CharField(max_length=100)
 
 keyword = Book.objects.values("title").annotate(n=Count("id")).get()
-assert_type(keyword["title"], Any)
+assert_type(keyword["title"], str)
 assert_type(keyword["n"], Any)
 positional = Book.objects.values("title").annotate(Count("id")).get()
 assert_type(positional["title"], Any)

@@ -28,6 +28,8 @@ use pyrefly_types::keywords::TypeMap;
 use pyrefly_types::known_class::KnownClass;
 use pyrefly_types::literal::Lit;
 use pyrefly_types::tuple::Tuple;
+use pyrefly_types::typed_dict::AnonymousTypedDictInner;
+use pyrefly_types::typed_dict::TypedDictField;
 use pyrefly_types::types::AnyStyle;
 use pyrefly_types::types::Overload;
 use pyrefly_types::types::OverloadType;
@@ -103,6 +105,15 @@ const AS_MANAGER: Name = Name::new_static("as_manager");
 pub(crate) struct DjangoAnnotateCall {
     metadata: FuncMetadata,
     attributes: TypeMap,
+    /// Whether any annotation is positional, which Django names with a generated alias.
+    has_positional: bool,
+}
+
+pub(crate) struct DjangoValuesCall {
+    /// The positional arguments, all string literals naming a field or lookup.
+    fields: Vec<Name>,
+    /// The keyword argument names, each naming an expression.
+    expressions: Vec<Name>,
 }
 
 pub(crate) struct DjangoValuesListCall {
@@ -177,6 +188,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         Some(DjangoAnnotateCall {
             metadata,
             attributes,
+            has_positional: !arguments.args.is_empty(),
         })
     }
 
@@ -193,6 +205,23 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             // `values_list()` row, which the row type does not track.
             if matches!(row, Type::Tuple(_)) {
                 return Some(self.heap.mk_any_implicit());
+            }
+            // A `values()` row gains one key per annotation. A positional annotation's key is a
+            // generated alias, and a missing key reads as the union of the other value types, so
+            // the row goes back to the untyped `dict[str, Any]`.
+            if let Type::AnonymousTypedDict(typed_dict) = row {
+                if call.has_positional {
+                    return Some(self.heap.mk_class_type(self.stdlib.dict(
+                        self.heap.mk_class_type(self.stdlib.str().clone()),
+                        self.heap.mk_any_implicit(),
+                    )));
+                }
+                let mut typed_dict = (**typed_dict).clone();
+                for (name, ty) in call.attributes.0 {
+                    typed_dict.fields.retain(|(key, _)| *key != name);
+                    typed_dict.fields.push((name, Self::django_values_key(ty)));
+                }
+                return Some(self.heap.mk_anonymous_typed_dict(typed_dict));
             }
             if call.attributes.0.is_empty() || !self.is_django_model_row(row) {
                 return None;
@@ -262,7 +291,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             let mut columns: Vec<Type> = call
                 .fields
                 .iter()
-                .map(|field| self.django_values_list_column(model, field.as_ref()))
+                .map(|field| self.django_column_type(model, field.as_ref()))
                 .collect();
             if call.flat {
                 Some(
@@ -276,10 +305,79 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         })
     }
 
-    /// The type Django returns for the `values_list()` column `field` of `model`, or `Any` when it
-    /// is not known without resolving a lookup path. A foreign key column holds the related
-    /// primary key, which is the type of the synthesized `<field>_id` attribute.
-    fn django_values_list_column(&self, model: &Type, field: Option<&Name>) -> Type {
+    /// Recognize `values()` calls whose keys are known from the arguments: at least one argument,
+    /// every positional argument a string literal, and no `**` keyword. Django names a positional
+    /// expression with a generated alias, so those calls are not handled.
+    pub(crate) fn infer_django_values_call(
+        &self,
+        callee: &Type,
+        arguments: &Arguments,
+    ) -> Option<DjangoValuesCall> {
+        let metadata = callee.toplevel_func_metadata()?;
+        if !Self::is_django_queryset_method(metadata, &VALUES)
+            || (arguments.args.is_empty() && arguments.keywords.is_empty())
+        {
+            return None;
+        }
+        let mut fields = Vec::new();
+        for arg in &arguments.args {
+            let Expr::StringLiteral(lit) = arg else {
+                return None;
+            };
+            fields.push(Name::new(lit.value.to_str()));
+        }
+        let mut expressions = Vec::new();
+        for keyword in &arguments.keywords {
+            expressions.push(keyword.arg.as_ref()?.id.clone());
+        }
+        Some(DjangoValuesCall {
+            fields,
+            expressions,
+        })
+    }
+
+    /// Make the row of a recognized `values()` call a TypedDict whose field keys have their
+    /// column types and whose expression keys are `Any`.
+    pub(crate) fn apply_django_values_call(
+        &self,
+        result: Type,
+        call: Option<DjangoValuesCall>,
+    ) -> Type {
+        let Some(call) = call else {
+            return result;
+        };
+        self.replace_django_queryset_row(result, |model, _| {
+            let mut fields = Vec::new();
+            for field in call.fields {
+                let ty = self.django_column_type(model, Some(&field));
+                fields.push((field, Self::django_values_key(ty)));
+            }
+            for expression in call.expressions {
+                fields.push((
+                    expression,
+                    Self::django_values_key(self.heap.mk_any_implicit()),
+                ));
+            }
+            Some(
+                self.heap
+                    .mk_anonymous_typed_dict(AnonymousTypedDictInner { fields }),
+            )
+        })
+    }
+
+    /// A key of a `values()` row, which every row has.
+    fn django_values_key(ty: Type) -> TypedDictField {
+        TypedDictField {
+            ty,
+            required: true,
+            read_only_reason: None,
+        }
+    }
+
+    /// The type Django returns for the `values()` or `values_list()` column `field` of `model`, or
+    /// `Any` when it is not known without resolving a lookup path. A foreign key column holds the
+    /// related primary key, which is the type of the synthesized `<field>_id` attribute.
+    fn django_column_type(&self, model: &Type, field: Option<&Name>) -> Type {
         let any = self.heap.mk_any_implicit();
         let (Some(field), Type::ClassType(model_cls)) = (field, model) else {
             return any;
