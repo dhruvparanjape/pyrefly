@@ -174,14 +174,10 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
                     .insert(name.id.clone(), self.heap.mk_any_implicit());
             }
         }
-        if attributes.0.is_empty() {
-            None
-        } else {
-            Some(DjangoAnnotateCall {
-                metadata,
-                attributes,
-            })
-        }
+        Some(DjangoAnnotateCall {
+            metadata,
+            attributes,
+        })
     }
 
     pub(crate) fn apply_django_annotate_call(
@@ -193,7 +189,12 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             return result;
         };
         self.replace_django_queryset_row(result, |_, row| {
-            if !self.is_django_model_row(row) {
+            // Django appends every annotation, positional or keyword, as a column of a
+            // `values_list()` row, which the row type does not track.
+            if matches!(row, Type::Tuple(_)) {
+                return Some(self.heap.mk_any_implicit());
+            }
+            if call.attributes.0.is_empty() || !self.is_django_model_row(row) {
                 return None;
             }
             let annotation = self.heap.mk_kw_call(KwCall {

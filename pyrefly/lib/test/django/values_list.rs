@@ -69,3 +69,42 @@ def check(names: list[str], flag: bool) -> None:
     assert_type(Book.objects.values_list("title", "price", flat=True).get(), Any)
 "#,
 );
+
+// Django appends `annotate()` columns to a `values_list()` row; the row type does not track them.
+django_testcase!(
+    test_values_list_then_annotate,
+    r#"
+from typing import Any, assert_type
+
+from django.db import models
+from django.db.models import Count
+
+class Book(models.Model):
+    title = models.CharField(max_length=100)
+
+assert_type(Book.objects.values_list("title").annotate(n=Count("id")).get(), Any)
+assert_type(Book.objects.values_list("title").annotate(Count("id")).get(), Any)
+assert_type(Book.objects.values_list("title", flat=True).annotate(n=Count("id")).get(), str)
+for title, n in Book.objects.values_list("title").annotate(n=Count("id")):
+    pass
+"#,
+);
+
+// The column holds the `to_field` value, a `str` here, as `<fk>_id` does.
+django_testcase!(
+    bug = "A foreign key with to_field= is typed as the related primary key",
+    test_values_list_foreign_key_to_field,
+    r#"
+from typing import assert_type
+
+from django.db import models
+
+class Slugged(models.Model):
+    slug = models.CharField(max_length=20, unique=True)
+
+class Book(models.Model):
+    slugged = models.ForeignKey(Slugged, on_delete=models.CASCADE, to_field="slug")
+
+assert_type(Book.objects.values_list("slugged").get(), tuple[int])
+"#,
+);
