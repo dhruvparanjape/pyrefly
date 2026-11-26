@@ -203,8 +203,10 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
             return_ty: row.clone(),
         });
         // The intersection preserves call-site metadata while generic QuerySet operations use the
-        // original row as their fallback type.
-        base.targs_mut().as_mut()[1] = self.heap.mk_intersect(vec![annotation], row);
+        // original row as their fallback type. The row is also a member, so that simplification
+        // cannot reduce the intersection to the bare `KwCall`: subset checks unwrap a bare
+        // `KwCall` before solving type variables, which would drop the annotated attributes.
+        base.targs_mut().as_mut()[1] = self.heap.mk_intersect(vec![annotation, row.clone()], row);
         if queryset.is(KnownClass::DjangoQuerySet) {
             queryset = base;
         } else {
