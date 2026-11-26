@@ -3640,6 +3640,8 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
 
         let django_annotate_call =
             self.infer_django_annotate_call(&callee.ty, &callee.expr.arguments);
+        let django_values_list_call =
+            self.infer_django_values_list_call(&callee.ty, &callee.expr.arguments);
         let polars_call =
             self.infer_polars_call_specialization(&callee.ty, &callee.expr.arguments, errors);
 
@@ -4009,6 +4011,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         };
 
         let result = self.apply_django_annotate_call(result, django_annotate_call);
+        let result = self.apply_django_values_list_call(result, django_values_list_call);
         self.apply_polars_call_specialization(result, polars_call)
     }
 

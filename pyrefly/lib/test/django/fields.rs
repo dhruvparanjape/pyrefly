@@ -761,7 +761,7 @@ class M(models.Model):
 assert_type(M.objects.all()[0], M)
 for row in M.objects.all():
     assert_type(row, M)
-assert_type(M.objects.all().values_list("id", flat=True).first(), Any | None)
+assert_type(M.objects.all().values_list("id", flat=True).first(), int | None)
 assert_type(M.objects.annotate(extra=models.Value(1)).get().extra, Any)
 assert_type(M.objects.annotate(extra=models.Value(1)).filter()[0].extra, Any)
 assert_type(M.objects.others().get(), Other)

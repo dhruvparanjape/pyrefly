@@ -95,6 +95,7 @@ const NULL: Name = Name::new_static("null");
 const BLANK: Name = Name::new_static("blank");
 const MODEL: Name = Name::new_static("Model");
 const ANNOTATE: Name = Name::new_static("annotate");
+const VALUES_LIST: Name = Name::new_static("values_list");
 const MANYRELATEDMANAGER: Name = Name::new_static("ManyRelatedManager");
 const SYMMETRICAL: Name = Name::new_static("symmetrical");
 const AS_MANAGER: Name = Name::new_static("as_manager");
@@ -102,6 +103,14 @@ const AS_MANAGER: Name = Name::new_static("as_manager");
 pub(crate) struct DjangoAnnotateCall {
     metadata: FuncMetadata,
     attributes: TypeMap,
+}
+
+pub(crate) struct DjangoValuesListCall {
+    /// One entry per positional argument: the field name, or `None` when the argument is not a
+    /// string literal.
+    fields: Vec<Option<Name>>,
+    /// `flat=True`, which makes the row the single column instead of a one-element tuple.
+    flat: bool,
 }
 
 /// Find a keyword argument by name and return its value expression.
@@ -132,14 +141,15 @@ enum DjangoRelationKind {
 }
 
 impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
-    fn is_django_annotate(metadata: &FuncMetadata) -> bool {
+    /// Whether `metadata` is the QuerySet or Manager method `name` from Django's stubs.
+    fn is_django_queryset_method(metadata: &FuncMetadata, name: &Name) -> bool {
         let Some(symbol) = metadata.kind.to_func_symbol() else {
             return false;
         };
         let Some(cls) = symbol.cls.as_ref() else {
             return false;
         };
-        symbol.name == ANNOTATE
+        symbol.name == *name
             && (cls.is(KnownClass::DjangoQuerySet) || cls.is(KnownClass::DjangoManager))
     }
 
@@ -149,7 +159,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         arguments: &Arguments,
     ) -> Option<DjangoAnnotateCall> {
         let metadata = callee.toplevel_func_metadata()?.clone();
-        if !Self::is_django_annotate(&metadata) {
+        if !Self::is_django_queryset_method(&metadata, &ANNOTATE) {
             return None;
         }
 
@@ -182,36 +192,152 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         let Some(call) = call else {
             return result;
         };
-        let mut queryset = match result {
-            Type::ClassType(queryset) => queryset,
-            result => return result,
+        self.replace_django_queryset_row(result, |_, row| {
+            if !self.is_django_model_row(row) {
+                return None;
+            }
+            let annotation = self.heap.mk_kw_call(KwCall {
+                func_metadata: call.metadata,
+                keywords: call.attributes,
+                return_ty: row.clone(),
+            });
+            // The intersection preserves call-site metadata while generic QuerySet operations use
+            // the original row as their fallback type. The row is also a member, so that
+            // simplification cannot reduce the intersection to the bare `KwCall`: subset checks
+            // unwrap a bare `KwCall` before solving type variables, which would drop the
+            // annotated attributes.
+            Some(
+                self.heap
+                    .mk_intersect(vec![annotation, row.clone()], row.clone()),
+            )
+        })
+    }
+
+    /// Recognize `values_list()` calls whose row shape is known from the arguments: at least one
+    /// positional argument, none of them starred, and no keyword except a literal `flat=` that
+    /// Django accepts (`flat=True` takes exactly one field). `named=True` rows are not handled.
+    pub(crate) fn infer_django_values_list_call(
+        &self,
+        callee: &Type,
+        arguments: &Arguments,
+    ) -> Option<DjangoValuesListCall> {
+        let metadata = callee.toplevel_func_metadata()?;
+        if !Self::is_django_queryset_method(metadata, &VALUES_LIST)
+            || arguments.args.is_empty()
+            || arguments.args.iter().any(|arg| arg.is_starred_expr())
+        {
+            return None;
+        }
+        let mut flat = false;
+        for keyword in &arguments.keywords {
+            match (keyword.arg.as_ref().map(|arg| arg.as_str()), &keyword.value) {
+                (Some("flat"), Expr::BooleanLiteral(lit)) => flat = lit.value,
+                _ => return None,
+            }
+        }
+        if flat && arguments.args.len() != 1 {
+            return None;
+        }
+        let fields = arguments
+            .args
+            .iter()
+            .map(|arg| match arg {
+                Expr::StringLiteral(lit) => Some(Name::new(lit.value.to_str())),
+                _ => None,
+            })
+            .collect();
+        Some(DjangoValuesListCall { fields, flat })
+    }
+
+    pub(crate) fn apply_django_values_list_call(
+        &self,
+        result: Type,
+        call: Option<DjangoValuesListCall>,
+    ) -> Type {
+        let Some(call) = call else {
+            return result;
+        };
+        self.replace_django_queryset_row(result, |model, _| {
+            let mut columns: Vec<Type> = call
+                .fields
+                .iter()
+                .map(|field| self.django_values_list_column(model, field.as_ref()))
+                .collect();
+            if call.flat {
+                Some(
+                    columns
+                        .pop()
+                        .expect("`flat=True` is only accepted with exactly one field"),
+                )
+            } else {
+                Some(self.heap.mk_concrete_tuple(columns))
+            }
+        })
+    }
+
+    /// The type Django returns for the `values_list()` column `field` of `model`, or `Any` when it
+    /// is not known without resolving a lookup path. A foreign key column holds the related
+    /// primary key, which is the type of the synthesized `<field>_id` attribute.
+    fn django_values_list_column(&self, model: &Type, field: Option<&Name>) -> Type {
+        let any = self.heap.mk_any_implicit();
+        let (Some(field), Type::ClassType(model_cls)) = (field, model) else {
+            return any;
+        };
+        let attr = if *field == PK || *field == ID {
+            field.clone()
+        } else {
+            match self
+                .get_non_synthesized_class_member(model_cls.class_object(), field)
+                .map(|member| member.ty())
+            {
+                Some(Type::ClassType(cls))
+                    if self.inherits_from_django_field(cls.class_object())
+                        && !self.is_many_to_many_field(cls.class_object()) =>
+                {
+                    if self.is_foreign_key_like_field(cls.class_object()) {
+                        Name::new(format!("{field}_id"))
+                    } else {
+                        field.clone()
+                    }
+                }
+                _ => return any,
+            }
+        };
+        self.attr_infer_for_type(
+            model,
+            &attr,
+            TextRange::default(),
+            &self.error_swallower(),
+            None,
+        )
+    }
+
+    /// Replace the row type argument of a `QuerySet` returned by a QuerySet or Manager method,
+    /// keeping any `QuerySet` subclass. `new_row` receives the model and current row type
+    /// arguments, and returns `None` to leave `result` unchanged.
+    fn replace_django_queryset_row(
+        &self,
+        result: Type,
+        new_row: impl FnOnce(&Type, &Type) -> Option<Type>,
+    ) -> Type {
+        let Type::ClassType(queryset) = result else {
+            return result;
         };
         let Some(mut base) = self.django_queryset_base(&queryset) else {
             return self.heap.mk_class_type(queryset);
         };
-        if base.targs().len() != 2 {
+        let [model, row] = base.targs().as_slice() else {
             return self.heap.mk_class_type(queryset);
-        }
-
-        let row = base.targs().as_slice()[1].clone();
-        if !self.is_django_model_row(&row) {
+        };
+        let Some(row) = new_row(model, row) else {
             return self.heap.mk_class_type(queryset);
-        }
-        let annotation = self.heap.mk_kw_call(KwCall {
-            func_metadata: call.metadata,
-            keywords: call.attributes,
-            return_ty: row.clone(),
-        });
-        // The intersection preserves call-site metadata while generic QuerySet operations use the
-        // original row as their fallback type. The row is also a member, so that simplification
-        // cannot reduce the intersection to the bare `KwCall`: subset checks unwrap a bare
-        // `KwCall` before solving type variables, which would drop the annotated attributes.
-        base.targs_mut().as_mut()[1] = self.heap.mk_intersect(vec![annotation, row.clone()], row);
-        if queryset.is(KnownClass::DjangoQuerySet) {
-            queryset = base;
+        };
+        base.targs_mut().as_mut()[1] = row;
+        let queryset = if queryset.is(KnownClass::DjangoQuerySet) {
+            base
         } else {
-            queryset = queryset.with_django_base(base);
-        }
+            queryset.with_django_base(base)
+        };
         self.heap.mk_class_type(queryset)
     }
 
@@ -230,7 +356,7 @@ impl<'ctx, 'answer, Ans: LookupAnswer> AnswersSolver<'ctx, 'answer, Ans> {
         match ty {
             Type::KwCall(call) => {
                 self.collect_django_annotated_fields(&call.return_ty, fields);
-                if Self::is_django_annotate(&call.func_metadata) {
+                if Self::is_django_queryset_method(&call.func_metadata, &ANNOTATE) {
                     for (name, ty) in &call.keywords.0 {
                         fields.insert(name.clone(), ty.clone());
                     }
