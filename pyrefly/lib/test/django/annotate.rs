@@ -41,3 +41,35 @@ for values_row in Article.objects.values("title").annotate(extra_title=models.F(
     values_row.extra_title  # E: Object of class `dict` has no attribute `extra_title`
 "#,
 );
+
+// https://github.com/pyrefly-org/pyrefly/issues/5677
+django_testcase!(
+    bug = "Annotated attributes are lost through solved type variables",
+    test_annotate_attributes_survive_generic_calls,
+    r#"
+from typing import Any, assert_type
+
+from django.db import models
+
+class Article(models.Model):
+    title = models.CharField(max_length=100)
+
+annotated = Article.objects.annotate(extra=models.F("title"))
+
+for a in annotated:
+    assert_type(a.extra, Any)  # E: Object of class `Article` has no attribute `extra`
+for b in annotated.only("title"):
+    assert_type(b.extra, Any)  # E: Object of class `Article` has no attribute `extra`
+for c in annotated.iterator():
+    assert_type(c.extra, Any)  # E: Object of class `Article` has no attribute `extra`
+assert_type(next(annotated.iterator()).extra, Any)  # E: Object of class `Article` has no attribute `extra`
+for d in [annotated.get()]:
+    assert_type(d.extra, Any)  # E: Object of class `Article` has no attribute `extra`
+
+def returned():
+    return Article.objects.annotate(extra=models.F("title"))
+
+for e in returned():
+    assert_type(e.extra, Any)  # E: Object of class `Article` has no attribute `extra`
+"#,
+);
